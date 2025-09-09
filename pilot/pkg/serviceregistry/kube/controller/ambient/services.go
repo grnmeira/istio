@@ -36,7 +36,6 @@ import (
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kubetypes"
 	"istio.io/istio/pkg/kube/controllers"
@@ -439,7 +438,7 @@ func constructServiceEntries(
 		// if we have no user-provided hostsAddresses and h is not wildcarded and we have hostsAddresses supported resolution
 		// we can try to use autoassigned hostsAddresses
 		hostsAddresses := addresses
-		if len(hostsAddresses) == 0 && !host.Name(h).IsWildCarded() && svc.Spec.Resolution != v1alpha3.ServiceEntry_NONE {
+		if len(hostsAddresses) == 0 && svc.Spec.Resolution != v1alpha3.ServiceEntry_NONE {
 			if hostsAddrs, ok := autoassignedHostAddresses[h]; ok {
 				hostsAddresses = slices.Map(hostsAddrs, func(e netip.Addr) *workloadapi.NetworkAddress {
 					return toNetworkAddressFromIP(e, networkGetter(ctx))

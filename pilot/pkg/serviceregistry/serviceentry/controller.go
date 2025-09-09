@@ -675,6 +675,7 @@ func (s *Controller) HasSynced() bool {
 func (s *Controller) Services() []*model.Service {
 	s.mutex.Lock()
 	allServices := s.services.getAllServices()
+	log.Debugf("jaellio: getting all services")
 	if s.services.allocateNeeded {
 		autoAllocateIPs(allServices)
 		s.services.allocateNeeded = false
@@ -947,6 +948,8 @@ func autoAllocateIPs(services []*model.Service) []*model.Service {
 			j++
 		}
 	}
+
+	log.Debugf("jaellio: finally allocating IPs")
 
 	x := 0
 	hnMap := make(map[string]octetPair)

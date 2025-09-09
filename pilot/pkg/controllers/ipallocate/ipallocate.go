@@ -30,7 +30,6 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	autoallocate "istio.io/istio/pilot/pkg/networking/serviceentry"
 	"istio.io/istio/pkg/config"
-	cfghost "istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/gvr"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -334,13 +333,16 @@ type jsonPatch struct {
 
 // filter out any wildcarded hosts
 func removeWildCarded(h string) bool {
-	return !cfghost.Name(h).IsWildCarded()
+	//return !cfghost.Name(h).IsWildCarded()
+	return true
 }
 
 func (c *IPAllocator) statusPatchForAddresses(se *networkingv1.ServiceEntry, forcedReassign bool) ([]byte, []byte, error) {
 	if se == nil {
 		return nil, nil, nil
 	}
+
+	log.Debugf("jaellio: patching addresses, remove wildcarded: %#v", removeWildCarded)
 
 	existingHostAddresses := autoallocate.GetHostAddressesFromServiceEntry(se)
 	hostsWithAddresses := sets.New[string]()
@@ -366,6 +368,8 @@ func (c *IPAllocator) statusPatchForAddresses(se *networkingv1.ServiceEntry, for
 
 	// nothing to patch
 	if hostsInSpec.Equals(hostsWithAddresses) && !forcedReassign {
+		log.Debugf("jaellio: nothing to patch")
+		log.Debugf("jaellio: %#v, %#v", hostsWithAddresses, hostsInSpec)
 		return nil, nil, nil
 	}
 
@@ -389,6 +393,8 @@ func (c *IPAllocator) statusPatchForAddresses(se *networkingv1.ServiceEntry, for
 			assignedAddresses = append(assignedAddresses, apiv1alpha3.ServiceEntryAddress{Value: a.String(), Host: host})
 		}
 	}
+
+	log.Debugf("jaellio: assigned addresses: %#v", assignedAddresses)
 
 	replaceAddresses, err := json.Marshal([]jsonPatch{
 		{
