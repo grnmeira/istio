@@ -357,6 +357,8 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 		return buildEmptyClusterLoadAssignment(b.clusterName)
 	}
 
+	log.Warnf("proxy ID: %s", b.proxy.ID)
+
 	// features.EnableIngressWaypointRouting only makes sense for ingress gateways and for E/W gateways
 	// we don't want this behavior, so additionally check that we are not generating endpoints for the
 	// E/W gateway.
@@ -392,6 +394,8 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 		}
 		return true
 	})
+
+	log.Warnf("svcEps: %+v", svcEps)
 
 	localityLbEndpoints := b.generate(svcEps, false)
 	if len(localityLbEndpoints) == 0 {
@@ -580,10 +584,15 @@ func (b *EndpointBuilder) snapshotShards(endpointIndex *model.EndpointIndex) []*
 			// If the downstream service is configured as cluster-local, only include endpoints that
 			// reside in the same cluster.
 			if isClusterLocal || b.service.Attributes.NodeLocal {
+				log.Warnf("not appending shardkey: %v", shardKey)
 				continue
 			}
 		}
+
 		eps = append(eps, shards.Shards[shardKey]...)
+		for _, ep := range shards.Shards[shardKey] {
+			log.Warnf("appending ep: %+v", ep.WorkloadName)
+		}
 	}
 	return eps
 }

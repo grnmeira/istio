@@ -195,41 +195,46 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 				addr := net.JoinHostPort(gwAddr, strconv.Itoa(gwPort))
 				svcPort := b.servicePort(b.port)
 
-				gwEp = &endpoint.LbEndpoint{
-					HostIdentifier: &endpoint.LbEndpoint_Endpoint{
-						Endpoint: &endpoint.Endpoint{
-							// We need to redirect to an internal listener that will tunnel the data through
-							// a double-HBONE, we still use the E/W gateway address though for the endpoint
-							// id.
-							Address: util.BuildInternalAddressWithIdentifier(innerConnectOriginate, addr),
+				for i := range 3 {
+					gwEp = &endpoint.LbEndpoint{
+						HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+							Endpoint: &endpoint.Endpoint{
+								// We need to redirect to an internal listener that will tunnel the data through
+								// a double-HBONE, we still use the E/W gateway address though for the endpoint
+								// id.
+								Address: util.BuildInternalAddressWithIdentifier(innerConnectOriginate, addr+string(i)),
+							},
 						},
-					},
-					LoadBalancingWeight: &wrappers.UInt32Value{
-						Value: epWeight,
-					},
-					Metadata: &core.Metadata{},
-				}
-
-				// TODO: figure out a way to extract locality data from the gateway public endpoints in meshNetworks
-				util.AppendLbEndpointMetadata(&model.EndpointMetadata{
-					Network: gw.Network,
-					// I don't think that TLSMode affects anythig downstream of this code anymore, but for ambient
-					// mode we do not rely on the legacy Istio mTLS, so I explicitly mark it as disabled.
-					TLSMode:   model.DisabledTLSModeLabel,
-					ClusterID: gw.Cluster,
-					Labels:    labels.Instance{},
-				}, gwEp.Metadata)
-
-				// We need to add original dst metadata key with the actual E/W gateway address that we will connect to
-				gwEp.Metadata.FilterMetadata[util.OriginalDstMetadataKey] = util.BuildTunnelMetadataStruct(gwAddr, gwPort, "")
-				// and we need the original service domain name and port that to put in the :authority of the HTTP2 CONNECT.
-				util.AppendDoubleHBONEMetadata(string(b.service.Hostname), svcPort.Port, gwEp.Metadata)
-				if b.dir != model.TrafficDirectionInboundVIP {
-					gwEp.Metadata.FilterMetadata[util.EnvoyTransportSocketMetadataKey] = &structpb.Struct{
-						Fields: map[string]*structpb.Value{
-							model.TunnelLabelShortName: {Kind: &structpb.Value_StringValue{StringValue: model.TunnelHTTP}},
+						LoadBalancingWeight: &wrappers.UInt32Value{
+							Value: epWeight,
 						},
+						Metadata: &core.Metadata{},
 					}
+
+					// TODO: figure out a way to extract locality data from the gateway public endpoints in meshNetworks
+					util.AppendLbEndpointMetadata(&model.EndpointMetadata{
+						Network: gw.Network,
+						// I don't think that TLSMode affects anythig downstream of this code anymore, but for ambient
+						// mode we do not rely on the legacy Istio mTLS, so I explicitly mark it as disabled.
+						TLSMode:   model.DisabledTLSModeLabel,
+						ClusterID: gw.Cluster,
+						Labels:    labels.Instance{},
+					}, gwEp.Metadata)
+
+					// We need to add original dst metadata key with the actual E/W gateway address that we will connect to
+					gwEp.Metadata.FilterMetadata[util.OriginalDstMetadataKey] = util.BuildTunnelMetadataStruct(gwAddr, gwPort, "")
+					// and we need the original service domain name and port that to put in the :authority of the HTTP2 CONNECT.
+					util.AppendDoubleHBONEMetadata(string(b.service.Hostname), svcPort.Port, gwEp.Metadata)
+					if b.dir != model.TrafficDirectionInboundVIP {
+						gwEp.Metadata.FilterMetadata[util.EnvoyTransportSocketMetadataKey] = &structpb.Struct{
+							Fields: map[string]*structpb.Value{
+								model.TunnelLabelShortName: {Kind: &structpb.Value_StringValue{StringValue: model.TunnelHTTP}},
+							},
+						}
+					}
+
+					// Currently gateway endpoint does not support tunnel.
+					lbEndpoints.append(gwIstioEp, gwEp)
 				}
 			} else {
 				epAddr := util.BuildAddress(gw.Addr, gw.Port)
@@ -252,10 +257,10 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 					ClusterID: gw.Cluster,
 					Labels:    labels.Instance{},
 				}, gwEp.Metadata)
-			}
 
-			// Currently gateway endpoint does not support tunnel.
-			lbEndpoints.append(gwIstioEp, gwEp)
+				// Currently gateway endpoint does not support tunnel.
+				lbEndpoints.append(gwIstioEp, gwEp)
+			}
 		}
 
 		// Endpoint members could be stripped or aggregated by network. Adjust weight value here.
