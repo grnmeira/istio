@@ -959,7 +959,7 @@ func buildRouteVHostDomains(svc *model.Service) []string {
 	// matching the original wildcarded service host.
 	domains := []string{"*"}
 	if svc != nil && svc.Resolution == model.DynamicDNS {
-		domains = []string{svc.Hostname.String()}
+		domains = []string{svc.Hostname.String(), svc.Hostname.String() + "."}
 	}
 	return domains
 }

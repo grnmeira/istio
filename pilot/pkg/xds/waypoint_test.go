@@ -696,7 +696,12 @@ spec:
 	g.Expect(httpConnMngr).NotTo(BeNil())
 	routeConfig := httpConnMngr.GetRouteConfig()
 	virtualHosts := xdstest.ExtractVirtualHosts(routeConfig)
+	// Both the hostname and the hostname with trailing dot should be present
+	// to handle requests with fully qualified domain names (FQDN)
 	g.Expect(virtualHosts["*.domain.com"]).To(Equal([]string{
+		"inbound-vip|80|http|*.domain.com",
+	}))
+	g.Expect(virtualHosts["*.domain.com."]).To(Equal([]string{
 		"inbound-vip|80|http|*.domain.com",
 	}))
 
