@@ -84,7 +84,7 @@ func setupIPAllocateTest(t *testing.T, ipv4Prefix, ipv6Prefix string) ipAllocate
 	}
 
 	se := clienttest.NewDirectClient[*networkingv1alpha3.ServiceEntry, networkingv1alpha3.ServiceEntry, *networkingv1alpha3.ServiceEntryList](t, c)
-	ipController := ipallocate.NewIPAllocator(s, c)
+	ipController := ipallocate.NewIPAllocator(ipallocate.ServiceEntryConsumers(s, c))
 	// these would normally be the first addresses consumed, we should check that warming works by asserting that we get their nexts when we reconcile
 	se.CreateOrUpdateStatus(
 		&networkingv1alpha3.ServiceEntry{

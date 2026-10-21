@@ -15,27 +15,16 @@
 package ipallocate
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
+	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	klabels "k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-
-	apiv1alpha3 "istio.io/api/networking/v1alpha3"
-	networkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	"istio.io/istio/pilot/pkg/features"
-	autoallocate "istio.io/istio/pilot/pkg/networking/serviceentry"
-	"istio.io/istio/pkg/config"
-	cfghost "istio.io/istio/pkg/config/host"
-	"istio.io/istio/pkg/config/schema/gvr"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
-	"istio.io/istio/pkg/kube/kclient"
-	"istio.io/istio/pkg/kube/kubetypes"
+	"istio.io/istio/pkg/kube/krt"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
@@ -43,12 +32,35 @@ import (
 
 var log = istiolog.RegisterScope("ip-autoallocate", "IP autoallocate controller")
 
+// IPAddressConsumer is a resource that requires auto-allocated IP addresses.
+// The IPAllocator owns the address pools and conflict detection, while the consumer owns
+// how addresses are read from and persisted to the underlying resource.
+type IPAddressConsumer interface {
+	// ResourceName is the krt key and the owner used for address tracking; it must be unique across all consumer kinds.
+	ResourceName() string
+	// Equals reports whether other represents the same state of this consumer.
+	Equals(other IPAddressConsumer) bool
+	// CreationTimestamp orders consumers on conflict; the oldest keeps a contested auto-assigned address.
+	CreationTimestamp() time.Time
+	// ShouldAllocate reports whether the consumer currently requires auto-assigned addresses.
+	ShouldAllocate() bool
+	// AutoAssignedAddresses returns the addresses currently persisted by the allocator.
+	AutoAssignedAddresses() []netip.Addr
+	// UserAssignedAddresses returns addresses not managed by the allocator which may still collide with its ranges.
+	UserAssignedAddresses() []netip.Addr
+	// AssignAddresses persists auto-assigned addresses, calling allocate for each set of addresses it needs.
+	// When forceReassign is true all existing auto-assigned addresses must be replaced.
+	// Addresses obtained from allocate are released by the allocator if an error is returned.
+	AssignAddresses(allocate func() []netip.Addr, forceReassign bool) error
+	// ClearAddresses removes all auto-assigned addresses from the resource.
+	ClearAddresses() error
+}
+
 type IPAllocator struct {
-	serviceEntryClient kclient.Informer[*networkingv1.ServiceEntry]
-	serviceEntryWriter kclient.Writer[*networkingv1.ServiceEntry]
-	index              kclient.Index[netip.Addr, *networkingv1.ServiceEntry]
-	stopChan           <-chan struct{}
-	queue              controllers.Queue
+	consumers krt.Collection[IPAddressConsumer]
+	index     krt.Index[netip.Addr, IPAddressConsumer]
+	handler   krt.HandlerRegistration
+	queue     controllers.Queue
 
 	// This controller is not safe for concurrency but it exists outside the critical path performing important but minimal functionality in a single thread.
 	// If we want the multi-thread this controller we must add locking around accessing the allocators which would otherwise be racy
@@ -67,7 +79,7 @@ func (c *IPAllocator) HasSynced() bool {
 // Workaround is a conversion of []netip.Addr to a string which is comparable but requires some helper
 // functions to be in any way reasonable.
 type conflictDetectedEvent struct {
-	conflictingResourceIdentifier types.NamespacedName
+	conflictingResourceIdentifier string
 	conflictingAddresses          string
 }
 
@@ -85,7 +97,7 @@ func (event conflictDetectedEvent) getAddresses() []netip.Addr {
 	return addresses
 }
 
-func newConflictDetectedEvent(id types.NamespacedName, addresses []netip.Addr) conflictDetectedEvent {
+func newConflictDetectedEvent(id string, addresses []netip.Addr) conflictDetectedEvent {
 	var conflictingAddresses string
 	if len(addresses) > 0 {
 		conflictingAddresses = addresses[0].String()
@@ -104,206 +116,144 @@ const (
 	controllerName = "IP Autoallocator"
 )
 
-func NewIPAllocator(stop <-chan struct{}, c kubelib.Client) *IPAllocator {
-	client := kclient.NewDelayedInformer[*networkingv1.ServiceEntry](c, gvr.ServiceEntry, kubetypes.StandardInformer, kclient.Filter{
-		ObjectFilter: c.ObjectFilter(),
-	})
-	writer := kclient.NewWriteClient[*networkingv1.ServiceEntry](c)
-	index := kclient.CreateIndex[netip.Addr, *networkingv1.ServiceEntry](client, "address", func(serviceentry *networkingv1.ServiceEntry) []netip.Addr {
-		addresses := autoallocate.GetAddressesFromServiceEntry(serviceentry)
-		for _, addr := range serviceentry.Spec.Addresses {
-			a, err := netip.ParseAddr(addr)
-			if err != nil {
-				continue
-			}
-			addresses = append(addresses, a)
-		}
-		return addresses
-	})
+// NewIPAllocator creates an allocator which assigns addresses to every IPAddressConsumer in consumers.
+// Consumers of different kinds can share a single allocator (and address pool) by joining their collections.
+func NewIPAllocator(consumers krt.Collection[IPAddressConsumer]) *IPAllocator {
 	allocator := &IPAllocator{
-		serviceEntryClient: client,
-		serviceEntryWriter: writer,
-		index:              index,
-		stopChan:           stop,
+		consumers: consumers,
+		index: krt.NewIndex(consumers, "address", func(consumer IPAddressConsumer) []netip.Addr {
+			return append(consumer.AutoAssignedAddresses(), consumer.UserAssignedAddresses()...)
+		}),
 		// MustParsePrefix is OK because these are const. If we allow user configuration we must not use this function.
 		v4allocator: newPrefixUse(netip.MustParsePrefix(features.IPAutoallocateIPv4Prefix)),
 		v6allocator: newPrefixUse(netip.MustParsePrefix(features.IPAutoallocateIPv6Prefix)),
 	}
 	allocator.queue = controllers.NewQueue(controllerName, controllers.WithGenericReconciler(allocator.reconcile), controllers.WithMaxAttempts(5))
-	client.AddEventHandler(controllers.ObjectHandler(allocator.queue.AddObject))
+	allocator.handler = consumers.Register(func(e krt.Event[IPAddressConsumer]) {
+		allocator.queue.Add(e.Latest().ResourceName())
+	})
 	return allocator
 }
 
 func (c *IPAllocator) Run(stop <-chan struct{}) {
 	log.Debugf("starting %s controller", controllerName)
-	kubelib.WaitForCacheSync(controllerName, stop, c.serviceEntryClient.HasSynced)
+	kubelib.WaitForCacheSync(controllerName, stop, c.consumers.HasSynced, c.handler.HasSynced)
 	// it is important that we always warm cache before we try to run the queue
 	// failing to warm cache first could result in allocating IP which are already in use
 	c.populateControllerDatastructures()
 	// logically the v1 behavior is a state of the world function which cannot be replicated in reconcile
-	// if we wish to replicate v1 assignment behavior for existing serviceentry it should go here and must
+	// if we wish to replicate v1 assignment behavior for existing consumers it should go here and must
 	// include a change to respect the used IPs from the warmed cache begin reconcile
 	c.queue.Run(stop)
-	c.serviceEntryClient.ShutdownHandlers()
+	c.handler.UnregisterHandler()
 }
 
-// populateControllerDatastructures reads all serviceentries and records any addresses in our ranges as in use
+// populateControllerDatastructures reads all consumers and records any addresses in our ranges as in use
 func (c *IPAllocator) populateControllerDatastructures() {
-	serviceentries := c.serviceEntryClient.List(metav1.NamespaceAll, klabels.Everything())
-	count := 0
-	for _, serviceentry := range serviceentries {
-		count++
-		owner := config.NamespacedName(serviceentry)
-		c.checkInSpecAddresses(serviceentry)
-		c.markUsedOrQueueConflict(autoallocate.GetAddressesFromServiceEntry(serviceentry), owner)
+	consumers := c.consumers.List()
+	for _, consumer := range consumers {
+		owner := consumer.ResourceName()
+		c.markUsedOrQueueConflict(consumer.UserAssignedAddresses(), owner)
+		c.markUsedOrQueueConflict(consumer.AutoAssignedAddresses(), owner)
 	}
 
-	log.Debugf("discovered %v during warming", count)
+	log.Debugf("discovered %v during warming", len(consumers))
 }
 
 func (c *IPAllocator) reconcile(a any) error {
-	if nn, ok := a.(types.NamespacedName); ok {
-		return c.reconcileServiceEntry(nn)
+	switch item := a.(type) {
+	case string:
+		return c.reconcileConsumer(item)
+	case conflictDetectedEvent:
+		return c.resolveConflict(item)
 	}
-	if conflict, ok := a.(conflictDetectedEvent); ok {
-		return c.resolveConflict(conflict)
-	}
-
 	return nil
 }
 
-func (c *IPAllocator) reconcileServiceEntry(se types.NamespacedName) error {
-	log := log.WithLabels("service entry", se)
+func (c *IPAllocator) reconcileConsumer(key string) error {
+	log := log.WithLabels("consumer", key)
 	log.Debugf("reconciling")
-	serviceentry := c.serviceEntryClient.Get(se.Name, se.Namespace)
-	if serviceentry == nil {
+	ptr := c.consumers.GetKey(key)
+	if ptr == nil {
 		log.Debugf("not found, no action required")
 		// probably a delete so we should remove ips from our addresses most likely
 		// TODO: we never actually remove IP right now, likely this should be done a little more slowly anyway to prevent reuse if we are too fast
 		return nil
 	}
+	consumer := *ptr
 
-	if !autoallocate.ShouldV2AutoAllocateIP(serviceentry) {
-		// we may have an address in our range so we should check and record it
-		c.checkInSpecAddresses(serviceentry)
-		if len(serviceentry.Status.Addresses) > 0 {
-			log.Debugf("allocation no longer required for %v, clearing stale addresses", config.NamespacedName(serviceentry))
-			return c.clearStaleAddresses(serviceentry)
+	// user assigned addresses are not managed by us but could conflict with our IP ranges
+	c.markUsedOrQueueConflict(consumer.UserAssignedAddresses(), key)
+
+	if !consumer.ShouldAllocate() {
+		if len(consumer.AutoAssignedAddresses()) > 0 {
+			log.Debugf("allocation no longer required, clearing stale addresses")
+			return c.clearStaleAddresses(consumer)
 		}
 		log.Debugf("allocation not required")
 		return nil
 	}
 
-	replaceAddresses, addStatusAndAddresses, newlyAllocated, err := c.statusPatchForAddresses(serviceentry, false)
+	// this is likely a noop, but just to be safe we should check and potentially resolve conflict
+	c.markUsedOrQueueConflict(consumer.AutoAssignedAddresses(), key)
+	return c.assignAddresses(consumer, false)
+}
+
+// assignAddresses delegates persisting addresses to the consumer, freeing any newly allocated
+// addresses if that fails (e.g. due to stale informer state) so they aren't leaked.
+func (c *IPAllocator) assignAddresses(consumer IPAddressConsumer, forceReassign bool) error {
+	owner := consumer.ResourceName()
+	var allocated []netip.Addr
+	err := consumer.AssignAddresses(func() []netip.Addr {
+		next := c.nextAddresses(owner)
+		allocated = append(allocated, next...)
+		return next
+	}, forceReassign)
 	if err != nil {
-		return err
+		c.freeAddresses(allocated, owner)
 	}
-
-	if replaceAddresses == nil {
-		log.Debugf("no change needed")
-		return nil // nothing to patch
-	}
-
-	// this patch may fail if there is no status which exists
-	_, err = c.serviceEntryWriter.PatchStatus(se.Name, se.Namespace, types.JSONPatchType, replaceAddresses)
-	if err != nil {
-		// try this patch which tests that status doesn't exist, adds status and then add addresses all in 1 operation
-		_, err2 := c.serviceEntryWriter.PatchStatus(se.Name, se.Namespace, types.JSONPatchType, addStatusAndAddresses)
-		if err2 != nil {
-			log.Errorf("second patch also rejected %v, patch: %s", err2.Error(), addStatusAndAddresses)
-			// Both patches failed, likely due to stale informer state.
-			// Free the IPs we allocated so they aren't leaked; the retry
-			// will re-read from the informer and re-allocate if needed.
-			c.freeAddresses(newlyAllocated, config.NamespacedName(serviceentry))
-			return err
-		}
-		return nil
-	}
-
-	log.Debugf("patched successfully")
-	return nil
+	return err
 }
 
 func (c *IPAllocator) resolveConflict(conflict conflictDetectedEvent) error {
-	var serviceentries, autoConflicts, userConflicts []*networkingv1.ServiceEntry
+	var autoConflicts []IPAddressConsumer
+	seen := sets.New[string]()
+	userConflict := false
 
 	for _, conflictingAddress := range conflict.getAddresses() {
-		serviceentries = append(serviceentries, c.index.Lookup(conflictingAddress)...)
-	}
-	for _, serviceentry := range serviceentries {
-		auto, user := allAddresses(serviceentry)
-		for _, conflictingAddress := range conflict.getAddresses() {
-			if slices.Contains(auto, conflictingAddress) {
-				autoConflicts = append(autoConflicts, serviceentry)
+		for _, consumer := range c.index.Lookup(conflictingAddress) {
+			if slices.Contains(consumer.UserAssignedAddresses(), conflictingAddress) {
+				userConflict = true
 			}
-			if slices.Contains(user, conflictingAddress) {
-				userConflicts = append(userConflicts, serviceentry)
+			if slices.Contains(consumer.AutoAssignedAddresses(), conflictingAddress) && !seen.InsertContains(consumer.ResourceName()) {
+				autoConflicts = append(autoConflicts, consumer)
 			}
 		}
 	}
 
-	slices.SortFunc(autoConflicts, func(a, b *networkingv1.ServiceEntry) int {
-		return a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
+	slices.SortFunc(autoConflicts, func(a, b IPAddressConsumer) int {
+		return a.CreationTimestamp().Compare(b.CreationTimestamp())
 	})
 
-	// this may be brittle since it relies on memory addresses being identical to filter
-	// should we simply take care when constructing to not append dupes
-	slices.FilterDuplicatesPresorted(autoConflicts)
-
+	// the oldest auto-assigned consumer keeps the address, unless a user assigned it
 	start := 1
-
-	if len(userConflicts) > 0 {
+	if userConflict {
 		start = 0
+	}
+	if len(autoConflicts) <= start {
+		return nil
 	}
 
 	var errs error
 	for _, resolveMe := range autoConflicts[start:] {
-		// filtering may leave behind nil values which we DO NOT want to deref
-		if resolveMe == nil {
-			continue
-		}
-		log.Warnf("reassigned %s/%s due to IP Address conflict", resolveMe.Namespace, resolveMe.Name)
-		// we are patching from the slice of ServiceEntry where the conflicting address was found in status.addresses
-		// this means we should already have a status and never need to use the patch that initializes the status
-		patch, _, newlyAllocated, err := c.statusPatchForAddresses(resolveMe, true)
-		if err != nil {
-			errs = errors.Join(errs, err)
-			continue
-		}
-
-		if patch == nil {
-			errs = errors.Join(errs, fmt.Errorf("this should not occur but patch was empty on a forced reassignment"))
-			continue
-		}
-
-		_, err = c.serviceEntryWriter.PatchStatus(resolveMe.Name, resolveMe.Namespace, types.JSONPatchType, patch)
-		if err != nil {
-			c.freeAddresses(newlyAllocated, config.NamespacedName(resolveMe))
-			errs = errors.Join(errs, err)
-		}
+		log.Warnf("reassigned %s due to IP Address conflict", resolveMe.ResourceName())
+		errs = errors.Join(errs, c.assignAddresses(resolveMe, true))
 	}
 
 	return errs
 }
 
-func allAddresses(se *networkingv1.ServiceEntry) ([]netip.Addr, []netip.Addr) {
-	if se == nil {
-		return nil, nil
-	}
-	autoAssigned := autoallocate.GetAddressesFromServiceEntry(se)
-	userAssigned := []netip.Addr{}
-
-	for _, a := range se.Spec.Addresses {
-		parsed, err := netip.ParseAddr(a)
-		if err != nil {
-			continue
-		}
-		userAssigned = append(userAssigned, parsed)
-	}
-	return autoAssigned, userAssigned
-}
-
-func (c *IPAllocator) nextAddresses(owner types.NamespacedName) []netip.Addr {
+func (c *IPAllocator) nextAddresses(owner string) []netip.Addr {
 	results := []netip.Addr{}
 	v4address, err := c.v4allocator.allocateNext(owner)
 	if err != nil {
@@ -322,7 +272,7 @@ func (c *IPAllocator) nextAddresses(owner types.NamespacedName) []netip.Addr {
 
 // freeAddresses releases addresses that were allocated by nextAddresses but never
 // successfully written (e.g. because the patch was rejected due to stale informer state).
-func (c *IPAllocator) freeAddresses(addrs []netip.Addr, owner types.NamespacedName) {
+func (c *IPAllocator) freeAddresses(addrs []netip.Addr, owner string) {
 	for _, a := range addrs {
 		a = a.Unmap()
 		if a.Is6() {
@@ -333,7 +283,7 @@ func (c *IPAllocator) freeAddresses(addrs []netip.Addr, owner types.NamespacedNa
 	}
 }
 
-func (c *IPAllocator) markUsedOrQueueConflict(maybeMappedAddrs []netip.Addr, owner types.NamespacedName) {
+func (c *IPAllocator) markUsedOrQueueConflict(maybeMappedAddrs []netip.Addr, owner string) {
 	conflictingAddrs := []netip.Addr{}
 	for _, maybeMappedAddr := range maybeMappedAddrs {
 		a := maybeMappedAddr.Unmap()
@@ -352,183 +302,32 @@ func (c *IPAllocator) markUsedOrQueueConflict(maybeMappedAddrs []netip.Addr, own
 	}
 }
 
-type jsonPatch struct {
-	Operation string      `json:"op"`
-	Path      string      `json:"path"`
-	Value     interface{} `json:"value"`
-}
-
-func keepHost(se *networkingv1.ServiceEntry, h string) bool {
-	// Only keep wildcarded hosts if the resolution is dynamic DNS
-	return !cfghost.Name(h).IsWildCarded() || se.Spec.Resolution == apiv1alpha3.ServiceEntry_DYNAMIC_DNS
-}
-
-// statusPatchForAddresses returns two patch variants (replace and add-status) along with
-// a list of any newly allocated addresses. On error, any newly allocated addresses are freed
-// internally and all return values will be nil. The caller must still free the newly allocated
-// addresses if neither patch succeeds, to avoid leaking IPs from the allocator.
-func (c *IPAllocator) statusPatchForAddresses(se *networkingv1.ServiceEntry, forcedReassign bool) ([]byte, []byte, []netip.Addr, error) {
-	if se == nil {
-		return nil, nil, nil, nil
-	}
-
-	existingHostAddresses := autoallocate.GetHostAddressesFromServiceEntry(se)
-	hostsWithAddresses := sets.New[string]()
-	hostsInSpec := sets.New[string]()
-
-	for _, host := range slices.Filter(se.Spec.Hosts, func(h string) bool { return keepHost(se, h) }) {
-		hostsInSpec.Insert(host)
-	}
-	existingAddresses := []netip.Addr{}
-
-	// collect existing addresses and the hosts which already have assigned addresses
-	for host, addresses := range existingHostAddresses {
-		// this is likely a noop, but just to be safe we should check and potentially resolve conflict
-		existingAddresses = append(existingAddresses, addresses...)
-		hostsWithAddresses.Insert(host)
-	}
-
-	// if we are being forced to reassign we already know there is a conflict
-	if !forcedReassign {
-		// if we're not being forced to reassign then we should ensure any addresses found are marked for use and queue up any conflicts found
-		c.markUsedOrQueueConflict(existingAddresses, config.NamespacedName(se))
-	}
-
-	// nothing to patch
-	if hostsInSpec.Equals(hostsWithAddresses) && !forcedReassign {
-		return nil, nil, nil, nil
-	}
-
-	assignedHosts := sets.New[string]()
-	var newlyAllocated []netip.Addr
-
-	// construct the assigned addresses datastructure to patch
-	assignedAddresses := []apiv1alpha3.ServiceEntryAddress{}
-	for _, host := range slices.Filter(se.Spec.Hosts, func(h string) bool { return keepHost(se, h) }) {
-		if assignedHosts.InsertContains(host) {
-			continue
-		}
-		assignedIPs := []netip.Addr{}
-		if aa, ok := existingHostAddresses[host]; ok && !forcedReassign {
-			// we already assigned this host, do not re-assign
-			assignedIPs = append(assignedIPs, aa...)
-		} else {
-			next := c.nextAddresses(config.NamespacedName(se))
-			newlyAllocated = append(newlyAllocated, next...)
-			assignedIPs = append(assignedIPs, next...)
-		}
-
-		for _, a := range assignedIPs {
-			assignedAddresses = append(assignedAddresses, apiv1alpha3.ServiceEntryAddress{Value: a.String(), Host: host})
-		}
-	}
-
-	replaceAddresses, err := json.Marshal([]jsonPatch{
-		// Ensure the existing status we are acting on has not changed since we decided to allocate.
-		// This avoids TOCTOU race conditions
-		{
-			Operation: "test",
-			Path:      "/status/addresses",
-			Value:     se.Status.Addresses,
-		},
-		{
-			Operation: "replace",
-			Path:      "/status/addresses",
-			Value:     assignedAddresses,
-		},
-	})
-
-	addStatusAndAddresses, err2 := json.Marshal([]jsonPatch{
-		{
-			Operation: "test",
-			Path:      "/status",
-			Value:     nil, // we want to test that status is nil before we try to modiy it with this
-		},
-		{
-			Operation: "add",
-			Path:      "/status",
-			Value:     apiv1alpha3.ServiceEntryStatus{},
-		},
-		{
-			Operation: "add",
-			Path:      "/status/addresses",
-			Value:     assignedAddresses,
-		},
-	})
-
-	if errs := errors.Join(err, err2); errs != nil {
-		c.freeAddresses(newlyAllocated, config.NamespacedName(se))
-		return nil, nil, nil, errs
-	}
-
-	return replaceAddresses, addStatusAndAddresses, newlyAllocated, nil
-}
-
-// clearStaleAddresses removes auto-allocated addresses from status when the
-// ServiceEntry no longer qualifies for auto-allocation (e.g. resolution
-// changed to NONE, user opted out, or user supplied their own addresses).
-func (c *IPAllocator) clearStaleAddresses(se *networkingv1.ServiceEntry) error {
-	nn := config.NamespacedName(se)
-	originalAddresses := autoallocate.GetAddressesFromServiceEntry(se)
-	if err := c.tryClearAddresses(se); err != nil {
-		// The TOCTOU "test" can fail if the status was modified between our
-		// informer read and the patch. Re-read and retry once before falling
-		// back to the queue's rate-limited retry.
-		se = c.serviceEntryClient.Get(nn.Name, nn.Namespace)
-		if se == nil || len(se.Status.Addresses) == 0 {
+// clearStaleAddresses removes auto-allocated addresses from a consumer which no longer
+// qualifies for auto-allocation and releases them from the pool.
+func (c *IPAllocator) clearStaleAddresses(consumer IPAddressConsumer) error {
+	owner := consumer.ResourceName()
+	originalAddresses := consumer.AutoAssignedAddresses()
+	if err := consumer.ClearAddresses(); err != nil {
+		// The consumer may have changed between our read and the write.
+		// Re-read and retry once before falling back to the queue's rate-limited retry.
+		latest := c.consumers.GetKey(owner)
+		if latest == nil || len((*latest).AutoAssignedAddresses()) == 0 {
 			// Already cleared or deleted; free the original addresses.
-			c.freeAddresses(originalAddresses, nn)
+			c.freeAddresses(originalAddresses, owner)
 			return nil
 		}
-		if err2 := c.tryClearAddresses(se); err2 != nil {
-			log.Errorf("failed to clear stale addresses for %v: %v", nn, err2)
+		if err2 := (*latest).ClearAddresses(); err2 != nil {
+			log.Errorf("failed to clear stale addresses for %v: %v", owner, err2)
 			return err2
 		}
 	}
-	c.freeAddresses(originalAddresses, nn)
+	c.freeAddresses(originalAddresses, owner)
 	return nil
-}
-
-func (c *IPAllocator) tryClearAddresses(se *networkingv1.ServiceEntry) error {
-	replaceAddresses, err := json.Marshal([]jsonPatch{
-		// Same TOCTOU guard as statusPatchForAddresses: test that addresses
-		// have not changed since we read them before replacing with empty.
-		{
-			Operation: "test",
-			Path:      "/status/addresses",
-			Value:     se.Status.Addresses,
-		},
-		{
-			Operation: "replace",
-			Path:      "/status/addresses",
-			Value:     []apiv1alpha3.ServiceEntryAddress{},
-		},
-	})
-	if err != nil {
-		return err
-	}
-	nn := config.NamespacedName(se)
-	_, err = c.serviceEntryWriter.PatchStatus(nn.Name, nn.Namespace, types.JSONPatchType, replaceAddresses)
-	return err
-}
-
-func (c *IPAllocator) checkInSpecAddresses(serviceentry *networkingv1.ServiceEntry) {
-	addrs := []netip.Addr{}
-	for _, addr := range serviceentry.Spec.Addresses {
-		a, err := netip.ParseAddr(addr)
-		if err != nil {
-			log.Debugf("unable to parse address %s for %s/%s, received error: %s", addr, serviceentry.Namespace, serviceentry.Name, err.Error())
-			continue
-		}
-		addrs = append(addrs, a)
-	}
-	// these are not assigned by us but could conflict with our IP ranges and cause issues
-	c.markUsedOrQueueConflict(addrs, config.NamespacedName(serviceentry))
 }
 
 type prefixUse struct {
 	prefix netip.Prefix
-	used   map[netip.Addr]types.NamespacedName
+	used   map[netip.Addr]string
 	next   netip.Addr
 }
 
@@ -536,12 +335,12 @@ func newPrefixUse(p netip.Prefix) *prefixUse {
 	n := p.Addr().Next()
 	return &prefixUse{
 		prefix: p,
-		used:   map[netip.Addr]types.NamespacedName{},
+		used:   map[netip.Addr]string{},
 		next:   n,
 	}
 }
 
-func (i *prefixUse) allocateNext(owner types.NamespacedName) (netip.Addr, error) {
+func (i *prefixUse) allocateNext(owner string) (netip.Addr, error) {
 	n := i.next
 	var looped bool
 	if !n.IsValid() || !i.prefix.Contains(n) {
@@ -573,11 +372,10 @@ func (i prefixUse) isUsed(n netip.Addr) bool {
 	return found
 }
 
-func (i prefixUse) isUsedBy(n netip.Addr, owner types.NamespacedName) (used, usedByOwner bool) {
+func (i prefixUse) isUsedBy(n netip.Addr, owner string) (used, usedByOwner bool) {
 	if foundOwner, found := i.used[n]; found {
 		used = true // it is in use
-		res := strings.Compare(foundOwner.String(), owner.String())
-		usedByOwner = res == 0 // is it in use by the providec owner?
+		usedByOwner = foundOwner == owner // is it in use by the provided owner?
 		return used, usedByOwner
 	}
 	return used, usedByOwner
@@ -585,7 +383,7 @@ func (i prefixUse) isUsedBy(n netip.Addr, owner types.NamespacedName) (used, use
 
 // free removes an address from the used map. If the address is before the current
 // next pointer, next is reset so the address can be reused by the next allocation.
-func (i *prefixUse) free(n netip.Addr, owner types.NamespacedName) {
+func (i *prefixUse) free(n netip.Addr, owner string) {
 	if foundOwner, found := i.used[n]; found && foundOwner == owner {
 		delete(i.used, n)
 		if !i.next.IsValid() || !i.prefix.Contains(i.next) || n.Less(i.next) {
@@ -596,7 +394,7 @@ func (i *prefixUse) free(n netip.Addr, owner types.NamespacedName) {
 
 // markUsed will store the provided addr as used in this ipAllocator
 // markUsed returns true if the addr was already used and false if it was a new insert
-func (i prefixUse) markUsed(n netip.Addr, owner types.NamespacedName) (used, usedByOwner bool) {
+func (i prefixUse) markUsed(n netip.Addr, owner string) (used, usedByOwner bool) {
 	if !i.prefix.Contains(n) {
 		// not in our range, no need to track it
 		return used, usedByOwner
