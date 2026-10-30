@@ -189,6 +189,8 @@ type Server struct {
 	RWConfigStore model.ConfigStoreController
 
 	krtDebugger *krt.DebugHandler
+
+	ipAllocatorController *ambient.IPAllocator
 }
 
 type readinessFlags struct {
@@ -1177,6 +1179,13 @@ func (s *Server) initControllers(args *PilotArgs) error {
 	log.Info("initializing controllers")
 	s.initMulticluster(args)
 
+	if s.multiclusterController != nil {
+		remoteServices := RemoteServicesCollection(s.multiclusterController, s.internalStop)
+		_ = remoteServices
+	}
+
+	s.initRemoteServicesController(args)
+
 	s.initSDSServer()
 
 	if features.EnableNodeUntaintControllers {
@@ -1230,6 +1239,51 @@ func (s *Server) initIPAutoallocateController(args *PilotArgs) {
 			AddRunFunction(func(leaderStop <-chan struct{}) {
 				ipallocate := ipallocate.NewIPAllocator(leaderStop, s.kubeClient)
 				ipallocate.Run(leaderStop)
+			}).Run(stop)
+		return nil
+	})
+}
+
+type RemoteService struct {
+	ClusterID cluster.ID
+	Service   *corev1.Service
+}
+
+func (s RemoteService) ResourceName() string {
+	return string(s.ClusterID) + "/" + s.Service.Namespace + "/" + s.Service.Name
+}
+
+func RemoteServicesCollection(mc *multicluster.Controller, stop <-chan struct{}) krt.Collection[RemoteService] {
+	opts := krt.NewOptionsBuilder(stop, "remote-service-address", nil)
+	nested := multicluster.NestedManyCollectionsFromLocalAndRemote(
+		mc,
+		nil,
+		func(_ krt.HandlerContext, remote multicluster.ClusterCollections) []krt.Collection[RemoteService] {
+			clusterID := remote.ID()
+			services := krt.MapCollection(remote.Services(), func(service *corev1.Service) RemoteService {
+				log.Debugf("remote service changed: %v", service.Name)
+				return RemoteService{ClusterID: clusterID, Service: service}
+			}, krt.WithName("RemoteServices["+string(clusterID)+"]"), krt.WithStop(remote.GetStop()))
+			return []krt.Collection[RemoteService]{services}
+		},
+		"ServicesByCluster",
+		opts,
+	)
+	return krt.NestedJoinWithMergeCollection(nested, func(services []RemoteService) *RemoteService {
+		return &services[0]
+	}, opts.WithName("RemoteServices")...)
+}
+
+func (s *Server) initRemoteServicesController(args *PilotArgs) {
+	if s.kubeClient == nil {
+		return
+	}
+	s.addStartFunc("remote services controller", func(stop <-chan struct{}) error {
+		go leaderelection.
+			NewLeaderElection(args.Namespace, args.PodName, leaderelection.RemoteServicesAddressController, args.Revision, s.kubeClient).
+			AddRunFunction(func(leaderStop <-chan struct{}) {
+				ambient.NewIPAllocator(s.kubeClient, leaderStop)
+				<-leaderStop
 			}).Run(stop)
 		return nil
 	})
