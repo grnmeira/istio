@@ -67,8 +67,10 @@ func (a *allocator) remove(cidr netip.Prefix) {
 		return
 	}
 
-	a.cidrs[ci] = a.cidrs[len(a.cidrs)-1]
-	a.cidrs = a.cidrs[:len(a.cidrs)-1]
+	last := len(a.cidrs) - 1
+	removedCurrent := a.currentCidr == ci
+	a.cidrs[ci] = a.cidrs[last]
+	a.cidrs = a.cidrs[:last]
 	delete(a.cidrIndex, cidr)
 
 	// If we have no CIDRs left
@@ -82,11 +84,11 @@ func (a *allocator) remove(cidr netip.Prefix) {
 		a.cidrIndex[a.cidrs[ci]] = ci
 	}
 
-	// If the next IP address belongs to the deleted cidr or
-	// if the current CIDR was pointing at the last one that
-	// has been deleted
-	if a.currentCidr >= len(a.cidrs) || cidr.Contains(a.nextAddress) {
-		a.nextCidr()
+	if removedCurrent {
+		a.currentCidr = ci % len(a.cidrs)
+		a.nextAddress = a.cidrs[a.currentCidr].Addr().Next()
+	} else if a.currentCidr == last {
+		a.currentCidr = ci
 	}
 }
 
