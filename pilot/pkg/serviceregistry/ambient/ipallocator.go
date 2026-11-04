@@ -4,6 +4,8 @@ import (
 	"net/netip"
 
 	networking "k8s.io/api/networking/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -105,8 +107,9 @@ func NewIPAllocator(client kube.Client, stop <-chan struct{}) *IPAllocator {
 		ipAddressCollection:   krt.WrapClient(kclient.New[*networking.IPAddress](client), krt.WithStop(stop)),
 		ipAddressWriter:       kclient.NewWriteClient[*networking.IPAddress](client),
 		serviceCidrCollection: krt.WrapClient(kclient.New[*networking.ServiceCIDR](client), krt.WithStop(stop)),
-		v4Allocator:           allocator{},
-		v6Allocator:           allocator{},
+		v4Allocator:           allocator{cidrIndex: make(map[netip.Prefix]int)},
+		v6Allocator:           allocator{cidrIndex: make(map[netip.Prefix]int)},
+		usedAddresses:         make(map[netip.Addr]bool),
 	}
 
 	ipallocator.ipAddressCollection.RegisterBatch(func(events []krt.Event[*networking.IPAddress]) {
@@ -173,5 +176,35 @@ func (a *IPAllocator) removeServiceCIDR(serviceCidr *networking.ServiceCIDR) {
 		}
 		a.v4Allocator.remove(cidr)
 		a.v6Allocator.remove(cidr)
+	}
+}
+
+func (a *IPAllocator) allocate() {
+	var first netip.Addr
+	for {
+		addr := a.v4Allocator.next()
+		if !addr.IsValid() || addr == first {
+			log.Warn("IPv4 address ranges exhausted")
+			return
+		}
+		if !first.IsValid() {
+			first = addr
+		}
+		if a.usedAddresses[addr] {
+			continue
+		}
+		_, err := a.ipAddressWriter.Create(&networking.IPAddress{
+			ObjectMeta: metav1.ObjectMeta{Name: addr.String()},
+		})
+		if apierrors.IsAlreadyExists(err) {
+			a.usedAddresses[addr] = true
+			continue
+		}
+		if err != nil {
+			log.Errorf("failed to create IPAddress %s: %v", addr, err)
+			return
+		}
+		a.usedAddresses[addr] = true
+		return
 	}
 }

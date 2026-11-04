@@ -18,14 +18,9 @@ func TestIPAllocatorAllocateMissingCIDR(t *testing.T) {
 	client := kube.NewFakeClient()
 	ipallocator := &IPAllocator{
 		ipAddressWriter: kclient.NewWriteClient[*networking.IPAddress](client),
-		v4Allocators:    make(map[string]allocator),
 		usedAddresses:   make(map[netip.Addr]bool),
 	}
-	owner := networking.ParentReference{
-		Resource: "services", Namespace: "default", Name: "test-service",
-	}
-
-	ipallocator.allocate("10.0.0.0/24", owner)
+	ipallocator.allocate()
 
 	addresses, err := client.Kube().NetworkingV1beta1().IPAddresses().List(context.Background(), metav1.ListOptions{})
 	assert.NoError(t, err)
@@ -35,15 +30,9 @@ func TestIPAllocatorAllocateMissingCIDR(t *testing.T) {
 
 func TestIPAllocatorAllocate(t *testing.T) {
 	const cidr = "10.0.0.0/24"
-	owner := networking.ParentReference{
-		Resource: "services", Namespace: "default", Name: "test-service",
-	}
-	address := func(ip, serviceName string) networking.IPAddress {
-		parent := owner
-		parent.Name = serviceName
+	address := func(ip string) networking.IPAddress {
 		return networking.IPAddress{
 			ObjectMeta: metav1.ObjectMeta{Name: ip},
-			Spec:       networking.IPAddressSpec{ParentRef: &parent},
 		}
 	}
 	tests := []struct {
@@ -54,22 +43,22 @@ func TestIPAllocatorAllocate(t *testing.T) {
 	}{
 		{
 			name: "creates next address",
-			want: []networking.IPAddress{address("10.0.0.1", "test-service")},
+			want: []networking.IPAddress{address("10.0.0.1")},
 		},
 		{
 			name:    "skips used address",
-			initial: []networking.IPAddress{address("10.0.0.1", "other-service")},
+			initial: []networking.IPAddress{address("10.0.0.1")},
 			want: []networking.IPAddress{
-				address("10.0.0.1", "other-service"),
-				address("10.0.0.2", "test-service"),
+				address("10.0.0.1"),
+				address("10.0.0.2"),
 			},
 		},
 		{
 			name:    "retries existing IPAddress",
-			initial: []networking.IPAddress{address("10.0.0.1", "other-service")},
+			initial: []networking.IPAddress{address("10.0.0.1")},
 			want: []networking.IPAddress{
-				address("10.0.0.1", "other-service"),
-				address("10.0.0.2", "test-service"),
+				address("10.0.0.1"),
+				address("10.0.0.2"),
 			},
 			staleCache: true,
 		},
@@ -83,11 +72,12 @@ func TestIPAllocatorAllocate(t *testing.T) {
 			client := kube.NewFakeClient(objects...)
 			ipallocator := &IPAllocator{
 				ipAddressWriter: kclient.NewWriteClient[*networking.IPAddress](client),
-				v4Allocators:    make(map[string]allocator),
 				usedAddresses:   make(map[netip.Addr]bool),
 			}
-			ipallocator.v4Allocators[cidr] = allocator{
-				cidr: netip.MustParsePrefix(cidr), nextAddress: netip.MustParseAddr("10.0.0.1"),
+			ipallocator.v4Allocator = allocator{
+				cidrIndex:   map[netip.Prefix]int{netip.MustParsePrefix(cidr): 0},
+				cidrs:       []netip.Prefix{netip.MustParsePrefix(cidr)},
+				nextAddress: netip.MustParseAddr("10.0.0.1"),
 			}
 			if !tt.staleCache {
 				for _, initial := range tt.initial {
@@ -95,7 +85,7 @@ func TestIPAllocatorAllocate(t *testing.T) {
 				}
 			}
 
-			ipallocator.allocate(cidr, owner)
+			ipallocator.allocate()
 
 			addresses, err := client.Kube().NetworkingV1beta1().IPAddresses().List(context.Background(), metav1.ListOptions{})
 			assert.NoError(t, err)
